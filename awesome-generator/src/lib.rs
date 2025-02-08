@@ -118,6 +118,7 @@ struct GarminResource {
     #[serde(with = "ymd_date")]
     last_updated: Option<chrono::DateTime<chrono::Utc>>,
     is_archived: bool,
+    stars: Option<u32>,
 }
 
 /// The data that is passed to render the template. It contains all the resolved Garmin resources
@@ -145,14 +146,29 @@ pub async fn generate_readme() -> anyhow::Result<()> {
     let resources = read_toml_file()?;
     let octocrab = Arc::new(
         octocrab::OctocrabBuilder::new()
-            .personal_token(std::env::var("GITHUB_TOKEN").unwrap())
+            .personal_token(std::env::var("GITHUB_TOKEN")?)
             .build()?,
     );
-    let glab = Arc::new(
-        gitlab::GitlabBuilder::new("gitlab.com", std::env::var("GITLAB_TOKEN")?)
-            .build_async()
-            .await?,
-    );
+    
+    // Try to create GitLab client, but continue without it if token is missing
+    let glab = match std::env::var("GITLAB_TOKEN") {
+        Ok(token) => {
+            match gitlab::GitlabBuilder::new("gitlab.com", token)
+                .build_async()
+                .await
+            {
+                Ok(client) => Some(Arc::new(client)),
+                Err(e) => {
+                    eprintln!("⚠️ Failed to create GitLab client: {}", e);
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("⚠️ GITLAB_TOKEN not found, GitLab repositories will be skipped");
+            None
+        }
+    };
 
     let data: Arc<Mutex<BTreeMap<String, Vec<GarminResource>>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
@@ -238,7 +254,7 @@ async fn update_resource(
     resource_url: String,
     resource: TomlFileItem,
     octocrab: Arc<Octocrab>,
-    glab: Arc<AsyncGitlab>,
+    glab: Option<Arc<AsyncGitlab>>,
     data: Arc<Mutex<BTreeMap<String, Vec<GarminResource>>>>,
 ) {
     eprintln!("Updating {}", resource_url);
@@ -246,7 +262,13 @@ async fn update_resource(
     let (resource, is_old) = if resource_url.contains("github.com") {
         update_github_resource(resource_url, &resource, octocrab).await
     } else if resource_url.contains("gitlab.com") {
-        update_gitlab_resource(resource_url, &resource, glab).await
+        if let Some(glab) = &glab {
+            update_gitlab_resource(resource_url, &resource, glab).await
+        } else {
+            // Skip GitLab repositories if no token is available
+            eprintln!("⚠️ Skipping GitLab repository: {}", resource_url);
+            return;
+        }
     } else if let Some(name) = resource.name {
         (
             Some(GarminResource {
@@ -255,6 +277,7 @@ async fn update_resource(
                 url: resource_url,
                 last_updated: None,
                 is_archived: false,
+                stars: None,
             }),
             true,
         )
@@ -299,6 +322,7 @@ async fn update_github_resource(
         url: resource_url.to_string(),
         last_updated: result.pushed_at,
         is_archived: result.archived.unwrap_or_default(),
+        stars: result.stargazers_count,
     };
 
     let is_old = if let Some(pushed_at) = result.pushed_at {
@@ -314,7 +338,7 @@ async fn update_github_resource(
 async fn update_gitlab_resource(
     resource_url: String,
     resource: &TomlFileItem,
-    glab: Arc<gitlab::AsyncGitlab>,
+    glab: &Arc<gitlab::AsyncGitlab>,
 ) -> (Option<GarminResource>, bool) {
     let u = url::Url::parse(&resource_url).unwrap();
     let owner_repo = u.path().strip_prefix('/').unwrap();
@@ -322,7 +346,7 @@ async fn update_gitlab_resource(
         .project(owner_repo)
         .build()
         .unwrap();
-    let result: GitLabProject = match endpoint.query_async(&*glab).await {
+    let result: GitLabProject = match endpoint.query_async(glab.as_ref()).await {
         Ok(result) => result,
         Err(err) => {
             eprintln!("⚠️ Could not get {}: {err}", resource_url);
@@ -341,6 +365,7 @@ async fn update_gitlab_resource(
         url: resource_url.to_string(),
         last_updated: Some(result.last_activity_at),
         is_archived: result.archived,
+        stars: None, // GitLab API 不提供 star 数量
     };
 
     (
